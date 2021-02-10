@@ -27,7 +27,6 @@ static std::string pid_file_name;
 static bool running {false};
 static int64_t counter {0};
 static int32_t pid_fd {-1};
-static char* app_name {nullptr};
 static FILE* log_stream;
 
 #define MAXEVENTS 1024
@@ -94,16 +93,17 @@ static int32_t process_command(
             constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
 
             // Substring first two chars for integer
-            const std::string& nums = splits[1];
+            const std::string& nums {splits[1]};
 
             // Substring for the command
-            const std::string& command = splits[0];
+            const std::string& command {splits[0]};
 
-            int32_t result;
+            int64_t result;
             bool err {true};
 
             try
             {
+				// Attempt to parse the number into a result
                 auto [p, ec] = std::from_chars(
                   nums.c_str(),
                   nums.c_str() + nums.length(),
@@ -285,7 +285,7 @@ static int32_t create_and_bind(const std::string& port)
 
         if (rp == nullptr)
         {
-            fprintf(log_stream, "Could not bind to port %s\n", port.c_str());
+            ::fprintf(log_stream, "Could not bind to port %s\n", port.c_str());
         }
 
         freeaddrinfo(result);
@@ -651,8 +651,6 @@ int main(int argc, char* const* argv)
 
     bool start_daemonized {false};
 
-    app_name = argv[0];
-
     // Try to process all command line arguments
     const char* const short_opts {"i:l:p:dh"};
 
@@ -702,7 +700,7 @@ int main(int argc, char* const* argv)
         // Open system log and write message to it
         openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
 
-        ::syslog(LOG_INFO, "Started %s", app_name);
+        ::syslog(LOG_INFO, "Started %s", argv[0]);
 
         // Try to open log file to this daemon
         if (!log_file_name.empty())
@@ -729,7 +727,7 @@ int main(int argc, char* const* argv)
         }
 
         // Write system log and close it.
-        ::syslog(LOG_INFO, "Stopped %s", app_name);
+        ::syslog(LOG_INFO, "Stopped %s", argv[0]);
         ::closelog();
     }
     catch (const std::exception& e)

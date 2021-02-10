@@ -1,14 +1,17 @@
 #ifndef DENS_UTILS_H
 #define DENS_UTILS_H
 
+#include <cstdint>
+#include <string>
+
 namespace density {
 
     template<typename container>
-    size_t split(const std::string& str, container& cont, char delim = ' ')
+    std::size_t split(const std::string& str, container& cont, char delim = ' ')
     {
-        size_t cnt {0};
-        size_t previous {0};
-        size_t current = str.find(delim);
+		std::size_t cnt {0};
+		std::size_t previous {0};
+		std::size_t current = str.find(delim);
         while (current != std::string::npos)
         {
             cnt++;
