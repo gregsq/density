@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 
 #include "defs.h"
+#include "utils.h"
 
 static std::string log_file_name;
 static std::string pid_file_name;
@@ -69,105 +70,111 @@ static void remove_fd(std::vector<int32_t>& allfds, int32_t fd)
 }
 
 static int32_t process_command(
-	int32_t fd,
-	const std::vector<int32_t>& allfds,
-	const char* telstr,
-	size_t count)
+  int32_t fd,
+  const std::vector<int32_t>& allfds,
+  const char* telstr,
+  size_t count)
 {
-    switch (count)
+    const char* end = telstr + count;
+    while (end > telstr && (*end == '\r' || *end == '\n' || *end == 0))
     {
-        case sizeof("xx INCR\n"):
+        end--;
+    }
+
+    std::string base(telstr, (end - telstr) + 1);
+
+    std::vector<std::string> splits;
+    auto components = density::split(base, splits);
+
+    switch (components)
+    {
+        case 2:
         {
-            std::string s {telstr};
-            if (s[2] == ' ')
+            constexpr std::int64_t maxcount {std::numeric_limits<int64_t>::max()};
+            constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
+
+            // Substring first two chars for integer
+            const std::string& nums = splits[1];
+
+            // Substring for the command
+            const std::string& command = splits[0];
+
+            int32_t result;
+            bool err {true};
+
+            try
             {
-                constexpr std::size_t numspace {sizeof("xx") - 1};
-                constexpr std::int64_t maxcount {std::numeric_limits<int64_t>::max()};
-                constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
-
-                // Substring first two chars for integer
-                std::string_view nums(s.c_str(), numspace);
-
-                // Substring for the command
-                std::string command(s.c_str() + numspace + 1, count - 5);
-
-                int32_t result;
-                bool err {true};
-
-                try
+                auto [p, ec] = std::from_chars(
+                  nums.c_str(),
+                  nums.c_str() + nums.length(),
+                  result);
+                if (ec == std::errc())
                 {
-                    auto [p, ec] = std::from_chars(
-                      nums.begin(),
-                      nums.end(),
-                      result);
-                    if (ec == std::errc())
+                    err = false;
+                }
+                else
+                {
+                    write_log("Debug: OUT OF BOUNDS\n");
+                }
+            }
+            catch (const std::exception& e)
+            {
+                write_log("Exception caught on conversion");
+            }
+
+            if (!err)
+            {
+                if (command == "INCR")
+                {
+                    // Increment
+                    if (counter <= 0 || (maxcount - counter) >= result)
                     {
-                        err = false;
+                        // Increase the counter
+                        counter += result;
+                        // Notify
                     }
                     else
                     {
-                        write_log("Debug: OUT OF BOUNDS\n");
+                        err = true;
                     }
                 }
-                catch (const std::exception& e)
+                else if (command == "DECR")
                 {
-                    write_log("Exception caught on conversion");
+                    // Decrement
+                    if (counter >= 0 || (counter - mincount) >= result)
+                    {
+                        // Decrease the counter
+                        counter -= result;
+                        // Notify
+                    }
+                    else
+                    {
+                        err = true;
+                    }
                 }
 
                 if (!err)
                 {
-                    if (command == "INCR")
+                    std::array<char, 120> str;
+                    auto [ptr, ec] = std::to_chars(
+                      str.data(),
+                      str.data() + str.size(),
+                      counter);
+
+                    std::string samt;
+                    samt.append(str.data(), ptr - str.data());
+                    samt += "\n";
+
+                    // Write to the connection that sent it
+                    ::write(fd, samt.c_str(), samt.length());
+
+                    // Write to all connections
+                    for (auto f : allfds)
                     {
-                        // Increment
-                        if (counter <= 0 || (maxcount - counter) >= result)
+                        if (f != fd)
                         {
-                            // Increase the counter
-                            counter += result;
-                            // Notify
-                        }
-                        else
-                        {
-                            err = true;
-                        }
-                    }
-                    else if (command == "DECR")
-                    {
-                        // Decrement
-                        if (counter >= 0 || (counter - mincount) >= result)
-                        {
-                            // Decrease the counter
-                            counter -= result;
-                            // Notify
-                        }
-                        else
-                        {
-                            err = true;
-                        }
-                    }
-
-                    if (!err)
-                    {
-                        std::array<char, 120> str;
-                        auto [ptr, ec] = std::to_chars(
-                          str.data(),
-                          str.data() + str.size(),
-                          counter);
-
-                        std::string samt;
-                        samt.append(str.data(), ptr - str.data());
-                        samt += "\n";
-
-                        // Write to the connection that sent it
-                        ::write(fd, samt.c_str(), samt.length());
-
-                        // Write to all connections
-                        for (auto f : allfds)
-                        {
-                            if (f != fd)
-                            {
-                                // Tell other connections
-                                ::write(f, samt.c_str(), samt.length());
-                            }
+                            // Tell other connections
+                            ::write(f, samt.c_str(), samt.length());
                         }
                     }
                 }
@@ -176,7 +183,7 @@ static int32_t process_command(
             break;
         }
 
-        case sizeof("OUTPUT\n"):
+        case 1:
         {
             // Write counter to the fd
             std::array<char, 120> str;
@@ -212,8 +219,7 @@ static int32_t process_command(
         break;
     }
 
-    auto s = ::write(1, telstr, count);
-    return s;
+    return count;
 }
 
 static int32_t make_socket_non_blocking(int32_t sfd)
@@ -345,7 +351,7 @@ static int do_epoll(const std::string& port)
                         std::vector<int32_t> allfds;
 
                         // The event loop
-						// Watch for signals
+                        // Watch for signals
                         while (running)
                         {
                             // Wait on the socket
@@ -356,7 +362,7 @@ static int do_epoll(const std::string& port)
                                 if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
                                 {
                                     ::fprintf(log_stream, "epoll error\n");
-									
+
                                     remove_fd(allfds, events[i].data.fd);
                                     ::close(events[i].data.fd);
                                 }
@@ -392,7 +398,8 @@ static int do_epoll(const std::string& port)
                                         if (s == 0)
                                         {
                                             ::fprintf(log_stream, "Accepted connection on descriptor %d "
-                                                                  "(host=%s, port=%s)\n", infd, hbuf, sbuf);
+                                                                  "(host=%s, port=%s)\n",
+                                              infd, hbuf, sbuf);
                                         }
 
                                         // Make the incoming socket non-blocking and add it to the list of fds to monitor.
@@ -629,8 +636,8 @@ static void s_catch_signals()
 
 int main(int argc, char* const* argv)
 {
-	int retcode {0};
-	
+    int retcode {0};
+
     // Default port number
     std::string port {"8089"};
 
@@ -690,45 +697,45 @@ int main(int argc, char* const* argv)
     // Install a signal handler
     s_catch_signals();
 
-	try
-	{		
-		// Open system log and write message to it
-		openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
+    try
+    {
+        // Open system log and write message to it
+        openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
 
-		::syslog(LOG_INFO, "Started %s", app_name);
+        ::syslog(LOG_INFO, "Started %s", app_name);
 
-		// Try to open log file to this daemon
-		if (!log_file_name.empty())
-		{
-			log_stream = ::fopen(log_file_name.c_str(), "a+");
-			if (log_stream == nullptr)
-			{
-				::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
-						 log_file_name.c_str(), strerror(errno));
-				log_stream = stdout;
-			}
-		}
-		else
-		{
-			log_stream = stdout;
-		}
+        // Try to open log file to this daemon
+        if (!log_file_name.empty())
+        {
+            log_stream = ::fopen(log_file_name.c_str(), "a+");
+            if (log_stream == nullptr)
+            {
+                ::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
+                  log_file_name.c_str(), strerror(errno));
+                log_stream = stdout;
+            }
+        }
+        else
+        {
+            log_stream = stdout;
+        }
 
-		retcode = do_epoll(port);
+        retcode = do_epoll(port);
 
-		// Close log file, when it is used.
-		if (log_stream != stdout)
-		{
-			::fclose(log_stream);
-		}
+        // Close log file, when it is used.
+        if (log_stream != stdout)
+        {
+            ::fclose(log_stream);
+        }
 
-		// Write system log and close it.
-		::syslog(LOG_INFO, "Stopped %s", app_name);
-		::closelog();
-	}
-	catch(const std::exception& e)
-	{
-		std::cout << "Caught exception " << e.what() << std::endl;		
-	}
-	
+        // Write system log and close it.
+        ::syslog(LOG_INFO, "Stopped %s", app_name);
+        ::closelog();
+    }
+    catch (const std::exception& e)
+    {
+        std::cout << "Caught exception " << e.what() << std::endl;
+    }
+
     return retcode;
 }
