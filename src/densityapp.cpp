@@ -17,16 +17,18 @@
 #include <netdb.h>
 #include <sys/epoll.h>
 
+#include "defs.h"
+
 static std::string log_file_name;
 static std::string pid_file_name;
 
 static bool running {false};
-static int64_t counter = 0;
+static int64_t counter {0};
 static int32_t pid_fd {-1};
 static char* app_name {nullptr};
 static FILE* log_stream;
 
-#define MAXEVENTS 64
+#define MAXEVENTS 1024
 
 static void write_log(const std::string& s)
 {
@@ -34,63 +36,84 @@ static void write_log(const std::string& s)
     if (ret < 0)
     {
         syslog(LOG_ERR, "Can not write to log stream: %s, error: %s",
-               (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
+          (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
     }
 }
 
-static int32_t process_command(const char* telstr, size_t count)
+// Write message and raise SIGABORT
+static NORETURN void write_log_fatal(const std::string& s)
+{
+    auto ret = ::fprintf(log_stream, s.c_str());
+    if (ret < 0)
+    {
+        ::syslog(LOG_ERR, "Can not write to log stream: %s, error: %s",
+          (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
+    }
+    abort();
+}
+
+static int32_t process_command(int32_t fd, const char* telstr, size_t count)
 {
     switch (count)
     {
         case sizeof("xx INCR\n"):
         {
-			std::string s {telstr};
-			if (s[2] == ' ')
-			{
-				constexpr std::size_t numspace {sizeof("xx") - 1};
-				constexpr std::int64_t maxcount {std::numeric_limits<int64_t>::max()};
-				constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
-				
-                // Substring first two chars
+            std::string s {telstr};
+            if (s[2] == ' ')
+            {
+                constexpr std::size_t numspace {sizeof("xx") - 1};
+                constexpr std::int64_t maxcount {std::numeric_limits<int64_t>::max()};
+                constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
+
+                // Substring first two chars for integer
                 std::string_view nums(s.c_str(), numspace);
-                std::string_view command(s.c_str() + numspace + 1, count - 3);
+
+                // Substring for the command
+                std::string command(s.c_str() + numspace + 1, count - 5);
 
                 int32_t result;
-				bool err {true};
-				
+                bool err {true};
+
                 try
                 {
                     auto [p, ec] = std::from_chars(
-						nums.begin(),
-						nums.end(),
-						result);
-                    if (ec != std::errc())
-					{
-						err = false;
-						
-                        std::string msg = "Number = ";
+                      nums.begin(),
+                      nums.end(),
+                      result);
+                    if (ec == std::errc())
+                    {
+                        err = false;
+
+                        std::string msg = "NUMBER = ";
                         msg += std::to_string(result);
                         msg += "\n";
 
-                        write_log(msg);
+                        ::write_log(msg);
                     }
-				}
+                    else
+                    {
+                        write_log("Debug: OUT OF BOUNDS\n");
+                    }
+                }
                 catch (const std::exception& e)
                 {
                     write_log("Exception caught on conversion");
                 }
 
-				if (!err)
-				{
+                if (!err)
+                {
                     if (command == "INCR")
                     {
                         // Increment
-                        if (counter < 0 || (maxcount - counter) >= result)
+                        if (counter <= 0 || (maxcount - counter) >= result)
                         {
                             // Increase the counter
                             counter += result;
-
                             // Notify
+                        }
+                        else
+                        {
+                            err = true;
                         }
                     }
                     else if (command == "DECR")
@@ -102,22 +125,42 @@ static int32_t process_command(const char* telstr, size_t count)
                             counter -= result;
                             // Notify
                         }
+                        else
+                        {
+                            err = true;
+                        }
+                    }
+
+                    if (!err)
+                    {
+                        std::array<char, 120> str;
+                        auto [ptr, ec] = std::to_chars(
+                          str.data(),
+                          str.data() + str.size(),
+                          counter);
+
+                        std::string samt;
+                        samt.append(str.data(), ptr - str.data());
+                        samt += "\n";
+                        ::write(fd, samt.c_str(), samt.length());
                     }
                 }
             }
 
-            write_log("SIZEOF XX INCR");
             break;
         }
 
-        case sizeof("xx COMMAND\n"):
+        case sizeof("xx OUTPUT\n"):
         {
-            write_log("SIZEOF XX COMMAND");
+            // Write counter to the fd
+            write_log("SIZEOF XX OUTPUT");
+
             break;
         }
 
         default:
         {
+            // Sanity check
             std::array<char, 120> str;
             auto [ptr, ec] = std::to_chars(
               str.data(),
@@ -126,8 +169,8 @@ static int32_t process_command(const char* telstr, size_t count)
 
             std::string samt = "SIZEOF XX COMMAND: ";
             samt.append(str.data(), ptr - str.data());
-			samt += "\n";
-			
+            samt += "\n";
+
             write_log(samt);
         }
 
@@ -178,216 +221,221 @@ static int32_t create_and_bind(const std::string& port)
     {
         fprintf(log_stream, "getaddrinfo: %s\n", gai_strerror(s));
     }
-	else
-	{		
-		for (rp = result; rp != nullptr; rp = rp->ai_next)
-		{
-			sfd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-			if (sfd == -1)
-			{				
-				continue;
-			}
-			
-			s = ::bind(sfd, rp->ai_addr, rp->ai_addrlen);
-			if (s == 0)
-			{
-				// We managed to bind successfully!
-				break;
-			}
+    else
+    {
+        for (rp = result; rp != nullptr; rp = rp->ai_next)
+        {
+            sfd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (sfd == -1)
+            {
+                continue;
+            }
 
-			::close(sfd);
-			sfd = -1;			
-		}
+            s = ::bind(sfd, rp->ai_addr, rp->ai_addrlen);
+            if (s == 0)
+            {
+                // We managed to bind successfully!
+                break;
+            }
 
-		if (rp == nullptr)
-		{
-			fprintf(log_stream, "Could not bind to port %s\n", port.c_str());
-		}
+            ::close(sfd);
+            sfd = -1;
+        }
 
-		freeaddrinfo(result);
-	}
-	
+        if (rp == nullptr)
+        {
+            fprintf(log_stream, "Could not bind to port %s\n", port.c_str());
+        }
+
+        freeaddrinfo(result);
+    }
+
     return sfd;
 }
 
+/// \brief Epoll till done
+///
+/// \param port The port number
 static int do_epoll(const std::string& port)
 {
-    epoll_event event;
-    epoll_event* events;
-
+    // Create and bind a tcp socket to the port
     auto sfd = create_and_bind(port);
     if (sfd == -1)
     {
-        write_log("Debug: create_and_bind failed");
-        abort();
+        write_log_fatal("Debug: create_and_bind failed");
     }
-
-    auto s = make_socket_non_blocking(sfd);
-    if (s == -1)
+    else
     {
-        write_log("Debug: make_socket_non_blocking failed");
-        abort();
-    }
-
-    s = ::listen(sfd, SOMAXCONN);
-    if (s == -1)
-    {
-        write_log("Debug: listen failed");
-        abort();
-    }
-
-    auto efd = epoll_create1(0);
-    if (efd == -1)
-    {
-        write_log("Debug: epoll_create failed");
-        abort();
-    }
-
-    event.data.fd = sfd;
-    event.events = EPOLLIN | EPOLLET;
-    s = epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event);
-    if (s == -1)
-    {
-        write_log("epoll_ctl");
-        abort();
-    }
-
-    // Buffer where events are returned
-	events = new epoll_event[MAXEVENTS];
-	::memset(events, 0, MAXEVENTS * sizeof(epoll_event));
-	
-    // The event loop
-    while (running)
-    {
-        int n = epoll_wait(efd, events, MAXEVENTS, -1);
-        for (int i = 0; i < n; ++i)
+        // Make the socket non blocking
+        auto s = make_socket_non_blocking(sfd);
+        if (s == -1)
         {
-            if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
+            write_log_fatal("Debug: make_socket_non_blocking failed");
+        }
+        else
+        {
+            epoll_event event;
+
+            // Listen on the socket
+            s = ::listen(sfd, SOMAXCONN);
+            if (s == -1)
             {
-                // An error has occured on this fd, or the socket is not
-                // ready for reading (why were we notified then?)
-                fprintf(log_stream, "epoll error\n");
-                close(events[i].data.fd);
-                continue;
-            }
-
-            else if (sfd == events[i].data.fd)
-            {
-                // We have a notification on the listening socket, which
-                // means one or more incoming connections.
-                for (;;)
-                {
-                    sockaddr in_addr;
-                    char hbuf[NI_MAXHOST];
-                    char sbuf[NI_MAXSERV];
-
-                    socklen_t in_len = sizeof(in_addr);
-                    int infd = accept(sfd, &in_addr, &in_len);
-                    if (infd == -1)
-                    {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK)
-                        {
-                            // We have processed all incoming
-                            // connections.
-                            break;
-                        }
-                        else
-                        {
-                            write_log("accept");
-                            break;
-                        }
-                    }
-
-                    s = ::getnameinfo(&in_addr, in_len,
-                                      hbuf, sizeof(hbuf),
-                                      sbuf, sizeof(sbuf),
-                                      NI_NUMERICHOST | NI_NUMERICSERV);
-                    if (s == 0)
-                    {
-                        fprintf(log_stream, "Accepted connection on descriptor %d "
-                                            "(host=%s, port=%s)\n",
-                                infd, hbuf, sbuf);
-                    }
-
-                    // Make the incoming socket non-blocking and add it to the
-                    // list of fds to monitor.
-                    s = make_socket_non_blocking(infd);
-                    if (s == -1)
-					{						
-                        write_log("Debug: make_socket_non_blocking");
-                        abort();
-					}
-					
-                    event.data.fd = infd;
-                    event.events = EPOLLIN | EPOLLET;
-                    s = epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
-                    if (s == -1)
-                    {
-                        write_log("Debug: epoll_ctl");
-                        abort();
-                    }
-                }
-                continue;
+                write_log_fatal("Debug: listen failed");
             }
             else
             {
-                // We have data on the fd waiting to be read. Read and
-                // display it. We must read whatever data is available
-                // completely, as we are running in edge-triggered mode
-                // and won't get a notification again for the same
-                // data.
-                bool done = false;
-
-                while (running)
+                auto efd = ::epoll_create1(0);
+                if (efd == -1)
                 {
-                    ssize_t count;
-                    char buf[512];
+                    write_log_fatal("Debug: epoll_create failed");
+                }
+                else
+                {
+                    event.data.fd = sfd;
+                    event.events = EPOLLIN | EPOLLET;
+                    s = ::epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event);
 
-                    count = read(events[i].data.fd, buf, sizeof buf);
-                    if (count == -1)
-                    {
-                        // If errno == EAGAIN, that means we have read all
-                        // data. So go back to the main loop.
-                        if (errno != EAGAIN)
-                        {
-                            write_log("Debug: read");
-                            done = true;
-                        }
-                        break;
-                    }
-                    else if (count == 0)
-                    {
-                        // End of file. The remote has closed the
-                        // connection.
-                        done = true;
-                        break;
-                    }
-
-                    // Process data
-					s = process_command(buf, count);
-					
                     if (s == -1)
                     {
-                        write_log("Debug: write");
-                        abort();
+                        write_log_fatal("Debug: epoll_ctl failed");
                     }
-                }
+                    else
+                    {
+                        // Buffer where events are returned
+                        auto* events = new epoll_event[MAXEVENTS];
+                        ::memset(events, 0, MAXEVENTS * sizeof(epoll_event));
 
-                if (done)
-                {
-                    std::cout << "Closed connection on descriptor " << events[i].data.fd << std::endl;
+                        // The event loop
+                        while (running)
+                        {
+                            // Wait on the socket
+                            int n = ::epoll_wait(efd, events, MAXEVENTS, -1);
+                            for (int i = 0; i < n; ++i)
+                            {
+                                if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
+                                {
+                                    // An error has occured on this fd, or the socket is not
+                                    // ready for reading (why were we notified then?)
+                                    ::fprintf(log_stream, "epoll error\n");
+                                    ::close(events[i].data.fd);
+                                    continue;
+                                }
 
-                    // Closing the descriptor will make epoll remove it
-                    // from the set of descriptors which are monitored.
-                    close(events[i].data.fd);
+                                else if (sfd == events[i].data.fd)
+                                {
+                                    // We have a notification on the listening socket, which
+                                    // means one or more incoming connections.
+                                    for (;;)
+                                    {
+                                        sockaddr in_addr;
+                                        char hbuf[NI_MAXHOST];
+                                        char sbuf[NI_MAXSERV];
+
+                                        socklen_t in_len {sizeof(in_addr)};
+                                        int infd = ::accept(sfd, &in_addr, &in_len);
+                                        if (infd == -1)
+                                        {
+                                            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                                            {
+                                                // We have processed all incoming
+                                                // connections.
+                                                break;
+                                            }
+                                            else
+                                            {
+                                                write_log("accept");
+                                                break;
+                                            }
+                                        }
+
+                                        s = ::getnameinfo(&in_addr, in_len,
+                                          hbuf, sizeof(hbuf),
+                                          sbuf, sizeof(sbuf),
+                                          NI_NUMERICHOST | NI_NUMERICSERV);
+                                        if (s == 0)
+                                        {
+                                            fprintf(log_stream, "Accepted connection on descriptor %d "
+                                                                "(host=%s, port=%s)\n",
+                                              infd, hbuf, sbuf);
+                                        }
+
+                                        // Make the incoming socket non-blocking and add it to the list of fds to monitor.
+                                        s = make_socket_non_blocking(infd);
+                                        if (s == -1)
+                                        {
+                                            write_log_fatal("Debug: make_socket_non_blocking");
+                                        }
+
+                                        event.data.fd = infd;
+                                        event.events = EPOLLIN | EPOLLET;
+                                        s = ::epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
+                                        if (s == -1)
+                                        {
+                                            write_log_fatal("Debug: epoll_ctl");
+                                        }
+                                    }
+                                    continue;
+                                }
+                                else
+                                {
+                                    bool done {false};
+
+                                    while (running)
+                                    {
+                                        ssize_t count;
+                                        char buf[512];
+
+                                        // Read from the fd
+                                        count = ::read(events[i].data.fd, buf, sizeof(buf));
+                                        if (count == -1)
+                                        {
+                                            // If errno == EAGAIN, that means we have read all
+                                            // data. So go back to the main loop.
+                                            if (errno != EAGAIN)
+                                            {
+                                                write_log("Debug: read");
+                                                done = true;
+                                            }
+                                            // And break
+                                            break;
+                                        }
+
+                                        if (count == 0)
+                                        {
+                                            // The remote has closed the connection.
+                                            done = true;
+                                            break;
+                                        }
+
+                                        // Process data
+                                        s = process_command(events[i].data.fd, buf, count);
+
+                                        if (s == -1)
+                                        {
+                                            write_log_fatal("Debug: write");
+                                        }
+                                    }
+
+                                    if (done)
+                                    {
+                                        std::cout << "Closed connection on descriptor " << events[i].data.fd << std::endl;
+
+                                        // Closing the descriptor will make epoll remove it
+                                        // from the set of descriptors which are monitored.
+                                        ::close(events[i].data.fd);
+                                    }
+                                }
+                            }
+                        }
+
+                        delete[] events;
+                    }
                 }
             }
         }
+
+        ::close(sfd);
     }
-
-    delete [] events;
-
-    ::close(sfd);
 
     return EXIT_SUCCESS;
 }
@@ -513,27 +561,27 @@ static void s_signal_handler(int sig)
         // Unlock and close lockfile
         if (pid_fd != -1)
         {
-            lockf(pid_fd, F_ULOCK, 0);
-            close(pid_fd);
+            ::lockf(pid_fd, F_ULOCK, 0);
+            ::close(pid_fd);
         }
         // Try to delete lockfile
         if (!pid_file_name.empty())
         {
-            unlink(pid_file_name.c_str());
+            ::unlink(pid_file_name.c_str());
         }
 
         running = false;
 
         // Reset signal handling to default behavior
-        signal(SIGINT, SIG_DFL);
+        ::signal(SIGINT, SIG_DFL);
     }
     else if (sig == SIGHUP)
     {
-        fprintf(log_stream, "Debug: reloading daemon config file ...\n");
+        ::fprintf(log_stream, "Debug: reloading daemon config file ...\n");
     }
     else if (sig == SIGCHLD)
     {
-        fprintf(log_stream, "Debug: received SIGCHLD signal\n");
+        ::fprintf(log_stream, "Debug: received SIGCHLD signal\n");
     }
 }
 
@@ -553,12 +601,12 @@ int main(int argc, char* const* argv)
     std::string port {"8089"};
 
     const option long_opts[] = {
-        {"log_file", required_argument, nullptr, 'l'},
-        {"interface", required_argument, nullptr, 'i'},
-        {"help", no_argument, nullptr, 'h'},
-        {"daemon", no_argument, nullptr, 'd'},
-        {"pid_file", required_argument, nullptr, 'p'},
-        {nullptr, no_argument, nullptr, 0}};
+      {"log_file", required_argument, nullptr, 'l'},
+      {"interface", required_argument, nullptr, 'i'},
+      {"help", no_argument, nullptr, 'h'},
+      {"daemon", no_argument, nullptr, 'd'},
+      {"pid_file", required_argument, nullptr, 'p'},
+      {nullptr, no_argument, nullptr, 0}};
 
     bool start_daemonized {false};
 
@@ -582,11 +630,11 @@ int main(int argc, char* const* argv)
                 pid_file_name = optarg;
                 break;
             case 'i':
-				// Override port
+                // Override port
                 port = optarg;
                 break;
             case 'd':
-				// Run as a daemon
+                // Run as a daemon
                 start_daemonized = true;
                 break;
             case 'h':
@@ -611,7 +659,7 @@ int main(int argc, char* const* argv)
     // Open system log and write message to it
     openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
 
-    syslog(LOG_INFO, "Started %s", app_name);
+    ::syslog(LOG_INFO, "Started %s", app_name);
 
     // Try to open log file to this daemon
     if (!log_file_name.empty())
@@ -619,8 +667,8 @@ int main(int argc, char* const* argv)
         log_stream = ::fopen(log_file_name.c_str(), "a+");
         if (log_stream == nullptr)
         {
-            syslog(LOG_ERR, "Can not open log file: %s, error: %s",
-                   log_file_name.c_str(), strerror(errno));
+            ::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
+              log_file_name.c_str(), strerror(errno));
             log_stream = stdout;
         }
     }
@@ -629,30 +677,7 @@ int main(int argc, char* const* argv)
         log_stream = stdout;
     }
 
-    // Never ending loop of server
-    while (running)
-    {
-        // Debug print
-        auto ret = fprintf(log_stream, "Debug: Counter %ld\n", counter++);
-        if (ret < 0)
-        {
-            syslog(LOG_ERR, "Can not write to log stream: %s, error: %s",
-                   (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
-            break;
-        }
-
-        ret = ::fflush(log_stream);
-        if (ret != 0)
-        {
-            syslog(LOG_ERR, "Can not fflush() log stream: %s, error: %s",
-                   (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
-            break;
-        }
-
-        do_epoll(port);
-
-        // sleep(delay);
-    }
+    auto retcode = do_epoll(port);
 
     // Close log file, when it is used.
     if (log_stream != stdout)
@@ -661,8 +686,8 @@ int main(int argc, char* const* argv)
     }
 
     // Write system log and close it.
-    syslog(LOG_INFO, "Stopped %s", app_name);
-    closelog();
+    ::syslog(LOG_INFO, "Stopped %s", app_name);
+    ::closelog();
 
-    return EXIT_SUCCESS;
+    return retcode;
 }
