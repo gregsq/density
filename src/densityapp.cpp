@@ -1,5 +1,6 @@
 #include <iostream>
 #include <array>
+#include <vector>
 #include <charconv>
 #include <stdio.h>
 #include <cstdlib>
@@ -52,7 +53,19 @@ static NORETURN void write_log_fatal(const std::string& s)
     abort();
 }
 
-static int32_t process_command(int32_t fd, const char* telstr, size_t count)
+static void remove_fd(std::vector<int32_t>& allfds, int32_t fd)
+{
+    for (auto it = allfds.begin(); it != allfds.end(); ++it)
+    {
+        if (*it == fd)
+        {
+            allfds.erase(it);
+            break;
+        }
+    }
+}
+
+static int32_t process_command(int32_t fd, const std::vector<int32_t>& allfds, const char* telstr, size_t count)
 {
     switch (count)
     {
@@ -83,12 +96,6 @@ static int32_t process_command(int32_t fd, const char* telstr, size_t count)
                     if (ec == std::errc())
                     {
                         err = false;
-
-                        std::string msg = "NUMBER = ";
-                        msg += std::to_string(result);
-                        msg += "\n";
-
-                        ::write_log(msg);
                     }
                     else
                     {
@@ -142,7 +149,19 @@ static int32_t process_command(int32_t fd, const char* telstr, size_t count)
                         std::string samt;
                         samt.append(str.data(), ptr - str.data());
                         samt += "\n";
+
+                        // Write to the connection that sent it
                         ::write(fd, samt.c_str(), samt.length());
+
+                        // Write to all connections
+                        for (auto f : allfds)
+                        {
+                            if (f != fd)
+                            {
+                                // Tell other connections
+                                ::write(f, samt.c_str(), samt.length());
+                            }
+                        }
                     }
                 }
             }
@@ -150,10 +169,19 @@ static int32_t process_command(int32_t fd, const char* telstr, size_t count)
             break;
         }
 
-        case sizeof("xx OUTPUT\n"):
+        case sizeof("OUTPUT\n"):
         {
             // Write counter to the fd
-            write_log("SIZEOF XX OUTPUT");
+            std::array<char, 120> str;
+            auto [ptr, ec] = std::to_chars(
+              str.data(),
+              str.data() + str.size(),
+              counter);
+
+            std::string samt;
+            samt.append(str.data(), ptr - str.data());
+            samt += "\n";
+            ::write(fd, samt.c_str(), samt.length());
 
             break;
         }
@@ -171,7 +199,7 @@ static int32_t process_command(int32_t fd, const char* telstr, size_t count)
             samt.append(str.data(), ptr - str.data());
             samt += "\n";
 
-            write_log(samt);
+            ::write_log(samt);
         }
 
         break;
@@ -305,18 +333,23 @@ static int do_epoll(const std::string& port)
                         auto* events = new epoll_event[MAXEVENTS];
                         ::memset(events, 0, MAXEVENTS * sizeof(epoll_event));
 
+                        // List of all fd's connected
+                        std::vector<int32_t> allfds;
+
                         // The event loop
                         while (running)
                         {
                             // Wait on the socket
                             int n = ::epoll_wait(efd, events, MAXEVENTS, -1);
+
                             for (int i = 0; i < n; ++i)
                             {
                                 if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
                                 {
-                                    // An error has occured on this fd, or the socket is not
-                                    // ready for reading (why were we notified then?)
+                                    // An error has occured on this fd, or the socket is not ready for reading
                                     ::fprintf(log_stream, "epoll error\n");
+                                    remove_fd(allfds, events[i].data.fd);
+
                                     ::close(events[i].data.fd);
                                     continue;
                                 }
@@ -337,8 +370,7 @@ static int do_epoll(const std::string& port)
                                         {
                                             if (errno == EAGAIN || errno == EWOULDBLOCK)
                                             {
-                                                // We have processed all incoming
-                                                // connections.
+                                                // rocessed all incoming connections.
                                                 break;
                                             }
                                             else
@@ -354,8 +386,8 @@ static int do_epoll(const std::string& port)
                                           NI_NUMERICHOST | NI_NUMERICSERV);
                                         if (s == 0)
                                         {
-                                            fprintf(log_stream, "Accepted connection on descriptor %d "
-                                                                "(host=%s, port=%s)\n",
+                                            ::fprintf(log_stream, "Accepted connection on descriptor %d "
+                                                                  "(host=%s, port=%s)\n",
                                               infd, hbuf, sbuf);
                                         }
 
@@ -365,6 +397,9 @@ static int do_epoll(const std::string& port)
                                         {
                                             write_log_fatal("Debug: make_socket_non_blocking");
                                         }
+
+                                        // Monitor this fd
+                                        allfds.push_back(infd);
 
                                         event.data.fd = infd;
                                         event.events = EPOLLIN | EPOLLET;
@@ -407,8 +442,8 @@ static int do_epoll(const std::string& port)
                                             break;
                                         }
 
-                                        // Process data
-                                        s = process_command(events[i].data.fd, buf, count);
+                                        // Process data from this source
+                                        s = process_command(events[i].data.fd, allfds, buf, count);
 
                                         if (s == -1)
                                         {
@@ -440,15 +475,13 @@ static int do_epoll(const std::string& port)
     return EXIT_SUCCESS;
 }
 
-/**
- * \brief This function will daemonize this app
- */
+/// \brief This function will daemonize this app
 static void daemonize()
 {
     int fd;
 
     // Fork off the parent process
-    pid_t pid = fork();
+    pid_t pid = ::fork();
 
     // An error occurred
     if (pid < 0)
@@ -469,10 +502,10 @@ static void daemonize()
     }
 
     // Ignore signal sent from child to parent process
-    signal(SIGCHLD, SIG_IGN);
+    ::signal(SIGCHLD, SIG_IGN);
 
     // Fork off for the second time
-    pid = fork();
+    pid = ::fork();
 
     // An error occurred
     if (pid < 0)
@@ -494,7 +527,7 @@ static void daemonize()
     ::chdir("/");
 
     // Close all open file descriptors
-    for (fd = sysconf(_SC_OPEN_MAX); fd > 0; fd--)
+    for (fd = ::sysconf(_SC_OPEN_MAX); fd > 0; fd--)
     {
         ::close(fd);
     }
@@ -516,12 +549,15 @@ static void daemonize()
 
         // Get current PID
         std::array<char, 10> pidstr;
-        auto [ptr, ec] = std::to_chars(pidstr.data(), pidstr.data() + pidstr.size(), getpid());
+        auto [ptr, ec] = std::to_chars(
+          pidstr.data(),
+          pidstr.data() + pidstr.size(),
+          getpid());
 
-        if (ec == std::errc())
+        if (ec != std::errc())
         {
             // Can't open lockfile
-            exit(EXIT_FAILURE);
+            ::exit(EXIT_FAILURE);
         }
 
         // Write PID to lockfile
@@ -529,9 +565,7 @@ static void daemonize()
     }
 }
 
-/**
- * \brief Print help for this application
- */
+/// \brief Print help for this application
 static const char* help_text = R"stop(
 densityapp:
 Options are:
@@ -548,10 +582,8 @@ void print_help()
     std::cout << help_text << std::endl;
 }
 
-/**
- * \brief Callback function for handling signals.
- * \param	sig	identifier of signal
- */
+/// \brief Callback function for handling signals.
+/// \param	sig	identifier of signal
 static void s_signal_handler(int sig)
 {
     if (sig == SIGINT)
