@@ -103,7 +103,7 @@ static int32_t process_command(
 
             try
             {
-				// Attempt to parse the number into a result
+                // Attempt to parse the number into a result
                 auto [p, ec] = std::from_chars(
                   nums.c_str(),
                   nums.c_str() + nums.length(),

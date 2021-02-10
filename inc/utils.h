@@ -9,9 +9,9 @@ namespace density {
     template<typename container>
     std::size_t split(const std::string& str, container& cont, char delim = ' ')
     {
-		std::size_t cnt {0};
-		std::size_t previous {0};
-		std::size_t current = str.find(delim);
+        std::size_t cnt {0};
+        std::size_t previous {0};
+        std::size_t current = str.find(delim);
         while (current != std::string::npos)
         {
             cnt++;
