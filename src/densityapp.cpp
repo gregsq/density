@@ -53,6 +53,9 @@ static NORETURN void write_log_fatal(const std::string& s)
     abort();
 }
 
+/// \brief
+///
+/// Remove an fd from the attached record
 static void remove_fd(std::vector<int32_t>& allfds, int32_t fd)
 {
     for (auto it = allfds.begin(); it != allfds.end(); ++it)
@@ -65,7 +68,11 @@ static void remove_fd(std::vector<int32_t>& allfds, int32_t fd)
     }
 }
 
-static int32_t process_command(int32_t fd, const std::vector<int32_t>& allfds, const char* telstr, size_t count)
+static int32_t process_command(
+	int32_t fd,
+	const std::vector<int32_t>& allfds,
+	const char* telstr,
+	size_t count)
 {
     switch (count)
     {
@@ -247,7 +254,7 @@ static int32_t create_and_bind(const std::string& port)
     auto s = ::getaddrinfo(nullptr, port.c_str(), &hints, &result);
     if (s != 0)
     {
-        fprintf(log_stream, "getaddrinfo: %s\n", gai_strerror(s));
+        ::fprintf(log_stream, "getaddrinfo: %s\n", gai_strerror(s));
     }
     else
     {
@@ -321,6 +328,7 @@ static int do_epoll(const std::string& port)
                 {
                     event.data.fd = sfd;
                     event.events = EPOLLIN | EPOLLET;
+
                     s = ::epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event);
 
                     if (s == -1)
@@ -337,6 +345,7 @@ static int do_epoll(const std::string& port)
                         std::vector<int32_t> allfds;
 
                         // The event loop
+						// Watch for signals
                         while (running)
                         {
                             // Wait on the socket
@@ -346,36 +355,32 @@ static int do_epoll(const std::string& port)
                             {
                                 if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
                                 {
-                                    // An error has occured on this fd, or the socket is not ready for reading
                                     ::fprintf(log_stream, "epoll error\n");
+									
                                     remove_fd(allfds, events[i].data.fd);
-
                                     ::close(events[i].data.fd);
-                                    continue;
                                 }
-
                                 else if (sfd == events[i].data.fd)
                                 {
-                                    // We have a notification on the listening socket, which
-                                    // means one or more incoming connections.
+                                    // Event(s) on the main port
+                                    sockaddr in_addr;
+                                    socklen_t in_len {sizeof(in_addr)};
+                                    char hbuf[NI_MAXHOST];
+                                    char sbuf[NI_MAXSERV];
+
                                     for (;;)
                                     {
-                                        sockaddr in_addr;
-                                        char hbuf[NI_MAXHOST];
-                                        char sbuf[NI_MAXSERV];
-
-                                        socklen_t in_len {sizeof(in_addr)};
                                         int infd = ::accept(sfd, &in_addr, &in_len);
                                         if (infd == -1)
                                         {
                                             if (errno == EAGAIN || errno == EWOULDBLOCK)
                                             {
-                                                // rocessed all incoming connections.
+                                                // Processed all incoming connections.
                                                 break;
                                             }
                                             else
                                             {
-                                                write_log("accept");
+                                                write_log("Debug: accepted all connections\n");
                                                 break;
                                             }
                                         }
@@ -387,15 +392,14 @@ static int do_epoll(const std::string& port)
                                         if (s == 0)
                                         {
                                             ::fprintf(log_stream, "Accepted connection on descriptor %d "
-                                                                  "(host=%s, port=%s)\n",
-                                              infd, hbuf, sbuf);
+                                                                  "(host=%s, port=%s)\n", infd, hbuf, sbuf);
                                         }
 
                                         // Make the incoming socket non-blocking and add it to the list of fds to monitor.
                                         s = make_socket_non_blocking(infd);
                                         if (s == -1)
                                         {
-                                            write_log_fatal("Debug: make_socket_non_blocking");
+                                            write_log_fatal("Debug: make_socket_non_blocking\n");
                                         }
 
                                         // Monitor this fd
@@ -404,12 +408,12 @@ static int do_epoll(const std::string& port)
                                         event.data.fd = infd;
                                         event.events = EPOLLIN | EPOLLET;
                                         s = ::epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
+
                                         if (s == -1)
                                         {
                                             write_log_fatal("Debug: epoll_ctl");
                                         }
                                     }
-                                    continue;
                                 }
                                 else
                                 {
@@ -424,20 +428,14 @@ static int do_epoll(const std::string& port)
                                         count = ::read(events[i].data.fd, buf, sizeof(buf));
                                         if (count == -1)
                                         {
-                                            // If errno == EAGAIN, that means we have read all
-                                            // data. So go back to the main loop.
-                                            if (errno != EAGAIN)
-                                            {
-                                                write_log("Debug: read");
-                                                done = true;
-                                            }
-                                            // And break
+                                            // If errno == EAGAIN, that means we have read all data. Keep going
+                                            done = errno != EAGAIN;
+                                            // And break from while loop
                                             break;
                                         }
-
                                         if (count == 0)
                                         {
-                                            // The remote has closed the connection.
+                                            // The remote has closed the connection or no data
                                             done = true;
                                             break;
                                         }
@@ -455,8 +453,8 @@ static int do_epoll(const std::string& port)
                                     {
                                         std::cout << "Closed connection on descriptor " << events[i].data.fd << std::endl;
 
-                                        // Closing the descriptor will make epoll remove it
-                                        // from the set of descriptors which are monitored.
+                                        // Closing the descriptor will make epoll remove it from the set of descriptors which are monitored.
+                                        remove_fd(allfds, events[i].data.fd);
                                         ::close(events[i].data.fd);
                                     }
                                 }
@@ -586,9 +584,9 @@ void print_help()
 /// \param	sig	identifier of signal
 static void s_signal_handler(int sig)
 {
-    if (sig == SIGINT)
+    if (sig == SIGINT || sig == SIGTERM)
     {
-        fprintf(log_stream, "Debug: stopping daemon ...\n");
+        ::fprintf(log_stream, "Debug: stopping daemon ...\n");
 
         // Unlock and close lockfile
         if (pid_fd != -1)
@@ -609,7 +607,7 @@ static void s_signal_handler(int sig)
     }
     else if (sig == SIGHUP)
     {
-        ::fprintf(log_stream, "Debug: reloading daemon config file ...\n");
+        ::fprintf(log_stream, "Debug: received SIGHUP signal\n");
     }
     else if (sig == SIGCHLD)
     {
@@ -625,10 +623,14 @@ static void s_catch_signals()
     ::sigemptyset(&action.sa_mask);
     ::sigaction(SIGINT, &action, nullptr);
     ::sigaction(SIGTERM, &action, nullptr);
+    ::sigaction(SIGHUP, &action, nullptr);
+    ::sigaction(SIGCHLD, &action, nullptr);
 }
 
 int main(int argc, char* const* argv)
 {
+	int retcode {0};
+	
     // Default port number
     std::string port {"8089"};
 
@@ -688,38 +690,45 @@ int main(int argc, char* const* argv)
     // Install a signal handler
     s_catch_signals();
 
-    // Open system log and write message to it
-    openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
+	try
+	{		
+		// Open system log and write message to it
+		openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
 
-    ::syslog(LOG_INFO, "Started %s", app_name);
+		::syslog(LOG_INFO, "Started %s", app_name);
 
-    // Try to open log file to this daemon
-    if (!log_file_name.empty())
-    {
-        log_stream = ::fopen(log_file_name.c_str(), "a+");
-        if (log_stream == nullptr)
-        {
-            ::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
-              log_file_name.c_str(), strerror(errno));
-            log_stream = stdout;
-        }
-    }
-    else
-    {
-        log_stream = stdout;
-    }
+		// Try to open log file to this daemon
+		if (!log_file_name.empty())
+		{
+			log_stream = ::fopen(log_file_name.c_str(), "a+");
+			if (log_stream == nullptr)
+			{
+				::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
+						 log_file_name.c_str(), strerror(errno));
+				log_stream = stdout;
+			}
+		}
+		else
+		{
+			log_stream = stdout;
+		}
 
-    auto retcode = do_epoll(port);
+		retcode = do_epoll(port);
 
-    // Close log file, when it is used.
-    if (log_stream != stdout)
-    {
-        ::fclose(log_stream);
-    }
+		// Close log file, when it is used.
+		if (log_stream != stdout)
+		{
+			::fclose(log_stream);
+		}
 
-    // Write system log and close it.
-    ::syslog(LOG_INFO, "Stopped %s", app_name);
-    ::closelog();
-
+		// Write system log and close it.
+		::syslog(LOG_INFO, "Stopped %s", app_name);
+		::closelog();
+	}
+	catch(const std::exception& e)
+	{
+		std::cout << "Caught exception " << e.what() << std::endl;		
+	}
+	
     return retcode;
 }
