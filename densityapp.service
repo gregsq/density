@@ -5,7 +5,6 @@ Description=forking densityapp program
 Type=forking
 PIDFile=/var/run/densityapp.pid
 ExecStart=/usr/bin/densityapp \
-	--conf_file /etc/densityapp/densityapp.conf \
 	--log_file /var/log/densityapp.log \
 	--pid_file /var/run/densityapp.pid \
 	--daemon

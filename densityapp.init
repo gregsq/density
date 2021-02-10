@@ -26,7 +26,6 @@ prog="densityapp"
 app="/usr/bin/$prog"
 lock_file="/var/lock/subsys/$prog"
 log_file="/var/log/$prog.log"
-conf_file="/etc/densityapp/densityapp.conf"
 proguser=root
 
 [ -e /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
@@ -35,7 +34,7 @@ start() {
     [ -x $exec ] || exit 5
 
     echo -n $"Starting $prog: "
-    daemon --user $proguser $app --conf_file $conf_file --log_file $log_file --daemon
+    daemon --user $proguser $app --log_file $log_file --daemon
     RETVAL=$?
     [ $RETVAL -eq 0 ] && touch $lock_file
     echo
