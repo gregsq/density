@@ -72,7 +72,7 @@ static int32_t process_command(
   int32_t fd,
   const std::vector<int32_t>& allfds,
   const char* telstr,
-  size_t count)
+  std::size_t count)
 {
     const char* end = telstr + count;
     while (end > telstr && (*end == '\r' || *end == '\n' || *end == 0))
@@ -80,143 +80,113 @@ static int32_t process_command(
         end--;
     }
 
-    std::string base(telstr, (end - telstr) + 1);
-
-    std::vector<std::string> splits;
-    auto components = density::split(base, splits);
-
-    switch (components)
+    if (end >= telstr)
     {
-        case 2:
+        std::string base(telstr, (end - telstr) + 1);
+
+        // Split string into here
+        std::vector<std::string> splits;
+        auto components = density::split(base, splits);
+        std::string reply;
+
+        switch (components)
         {
-            constexpr std::int64_t maxcount {std::numeric_limits<int64_t>::max()};
-            constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
-
-            // Substring first two chars for integer
-            const std::string& nums {splits[1]};
-
-            // Substring for the command
-            const std::string& command {splits[0]};
-
-            int64_t result;
-            bool err {true};
-
-            try
+            case 2:
             {
-                // Attempt to parse the number into a result
-                auto [p, ec] = std::from_chars(
+                constexpr std::int64_t maxcount {std::numeric_limits<int64_t>::max()};
+                constexpr std::int64_t mincount {std::numeric_limits<int64_t>::min()};
+
+                // Substring first two chars for integer
+                const std::string& nums {splits[1]};
+
+                // Substring for the command
+                const std::string& command {splits[0]};
+
+                int64_t result {0};
+                auto success = density::from_chars(
                   nums.c_str(),
                   nums.c_str() + nums.length(),
                   result);
-                if (ec == std::errc())
-                {
-                    err = false;
-                }
-                else
+                if (!success)
                 {
                     write_log("Debug: OUT OF BOUNDS\n");
                 }
-            }
-            catch (const std::exception& e)
-            {
-                write_log("Exception caught on conversion");
-            }
-
-            if (!err)
-            {
-                if (command == "INCR")
+                else
                 {
-                    // Increment
-                    if (counter <= 0 || (maxcount - counter) >= result)
+                    if (command == "INCR")
                     {
-                        // Increase the counter
-                        counter += result;
-                        // Notify
-                    }
-                    else
-                    {
-                        err = true;
-                    }
-                }
-                else if (command == "DECR")
-                {
-                    // Decrement
-                    if (counter >= 0 || (counter - mincount) >= result)
-                    {
-                        // Decrease the counter
-                        counter -= result;
-                        // Notify
-                    }
-                    else
-                    {
-                        err = true;
-                    }
-                }
-
-                if (!err)
-                {
-                    std::array<char, 120> str;
-                    auto [ptr, ec] = std::to_chars(
-                      str.data(),
-                      str.data() + str.size(),
-                      counter);
-
-                    std::string samt;
-                    samt.append(str.data(), ptr - str.data());
-                    samt += "\n";
-
-                    // Write to the connection that sent it
-                    ::write(fd, samt.c_str(), samt.length());
-
-                    // Write to all connections
-                    for (auto f : allfds)
-                    {
-                        if (f != fd)
+                        // Increment
+                        if (counter <= 0 || (maxcount - counter) >= result)
                         {
-                            // Tell other connections
-                            ::write(f, samt.c_str(), samt.length());
+                            // Increase the counter
+                            counter += result;
+                            // Notify
+                        }
+                        else
+                        {
+                            success = false;
+                        }
+                    }
+                    else if (command == "DECR")
+                    {
+                        // Decrement
+                        if (counter >= 0 || (counter - mincount) >= result)
+                        {
+                            // Decrease the counter
+                            counter -= result;
+                            // Notify
+                        }
+                        else
+                        {
+                            success = false;
+                        }
+                    }
+
+                    if (success)
+                    {
+                        if (density::to_chars(reply, counter))
+                        {
+                            reply += "\n";
+                            // Write to the connection that sent it
+                            ::write(fd, reply.c_str(), reply.length());
+
+                            // Write to all connections
+                            for (auto f : allfds)
+                            {
+                                if (f != fd)
+                                {
+                                    // Tell other connections
+                                    ::write(f, reply.c_str(), reply.length());
+                                }
+                            }
                         }
                     }
                 }
+
+                break;
+            }
+
+            case 1:
+            {
+                if (splits[0] == "OUTPUT")
+                {
+                    if (density::to_chars(reply, counter))
+                    {
+                        reply += "\n";
+                        ::write(fd, reply.c_str(), reply.length());
+                    }
+                }
+            }
+            break;
+
+            default:
+            {
+                reply = "RECIEVED UNKNOWN COMMAND";
+                ::write_log(reply);
             }
 
             break;
         }
-
-        case 1:
-        {
-            // Write counter to the fd
-            std::array<char, 120> str;
-            auto [ptr, ec] = std::to_chars(
-              str.data(),
-              str.data() + str.size(),
-              counter);
-
-            std::string samt;
-            samt.append(str.data(), ptr - str.data());
-            samt += "\n";
-            ::write(fd, samt.c_str(), samt.length());
-
-            break;
-        }
-
-        default:
-        {
-            // Sanity check
-            std::array<char, 120> str;
-            auto [ptr, ec] = std::to_chars(
-              str.data(),
-              str.data() + str.size(),
-              count);
-
-            std::string samt = "SIZEOF XX COMMAND: ";
-            samt.append(str.data(), ptr - str.data());
-            samt += "\n";
-
-            ::write_log(samt);
-        }
-
-        break;
     }
 
     return count;
@@ -297,6 +267,7 @@ static int32_t create_and_bind(const std::string& port)
 /// \brief Epoll till done
 ///
 /// \param port The port number
+/// \return success or fail
 static int do_epoll(const std::string& port)
 {
     // Create and bind a tcp socket to the port
@@ -430,6 +401,7 @@ static int do_epoll(const std::string& port)
                                     {
                                         ssize_t count;
                                         char buf[512];
+                                        ::memset(buf, 0, sizeof(buf));
 
                                         // Read from the fd
                                         count = ::read(events[i].data.fd, buf, sizeof(buf));
@@ -552,21 +524,16 @@ static void daemonize()
             exit(EXIT_FAILURE);
         }
 
-        // Get current PID
-        std::array<char, 10> pidstr;
-        auto [ptr, ec] = std::to_chars(
-          pidstr.data(),
-          pidstr.data() + pidstr.size(),
-          getpid());
-
-        if (ec != std::errc())
-        {
-            // Can't open lockfile
+		std::string asstring;
+		
+		if (!density::to_chars(asstring, getpid()))
+		{
+            // Should never happen
             ::exit(EXIT_FAILURE);
-        }
-
+		}
+		
         // Write PID to lockfile
-        ::write(pid_fd, pidstr.data(), ptr - pidstr.data());
+        ::write(pid_fd, asstring.c_str(), asstring.length());
     }
 }
 
