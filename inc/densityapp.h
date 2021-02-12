@@ -41,7 +41,7 @@ namespace density {
           const char* telstr,
           std::size_t count) -> int32_t;
 
-        auto make_socket_non_blocking(int32_t) noexcept -> bool;
+        auto set_socket_non_blocking(int32_t) noexcept -> bool;
         auto create_and_bind() noexcept -> int32_t;
         auto do_epoll() -> bool;
 

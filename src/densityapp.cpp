@@ -21,6 +21,7 @@
 #include "defs.h"
 #include "utils.h"
 #include "densityapp.h"
+#include "epoller.h"
 
 /// \brief Print help for this application
 static const char* help_text = R"stop(
@@ -200,7 +201,7 @@ namespace density {
         return count;
     }
 
-    auto DensityApp::make_socket_non_blocking(int32_t sock) noexcept -> bool
+    auto DensityApp::set_socket_non_blocking(int32_t sock) noexcept -> bool
     {
         bool ret {true};
 
@@ -286,14 +287,12 @@ namespace density {
         else
         {
             // Make the socket non blocking
-            if (!make_socket_non_blocking(sfd_))
+            if (!set_socket_non_blocking(sfd_))
             {
-                write_log_fatal("Debug: make_socket_non_blocking failed");
+                write_log_fatal("Debug: set_socket_non_blocking failed");
             }
             else
             {
-                epoll_event event;
-
                 // Listen on the socket
                 auto s = ::listen(sfd_, SOMAXCONN);
                 if (s == -1)
@@ -302,161 +301,139 @@ namespace density {
                 }
                 else
                 {
-                    efd_ = ::epoll_create1(0);
-                    if (efd_ == -1)
+                    density::EPoller poller;
+                    if (!poller.init(sfd_))
                     {
                         write_log_fatal("Debug: epoll_create failed");
                     }
                     else
                     {
-                        event.data.fd = sfd_;
-                        event.events = EPOLLIN | EPOLLET;
-
-                        s = ::epoll_ctl(efd_, EPOLL_CTL_ADD, sfd_, &event);
-
-                        if (s == -1)
+                        // The event loop
+                        // Watch for signals
+                        while (s_running_)
                         {
-                            write_log_fatal("Debug: epoll_ctl failed");
-                        }
-                        else
-                        {
-                            // Buffer where events are returned
-                            auto* events = new epoll_event[s_max_events];
-                            ::memset(events, 0, s_max_events * sizeof(epoll_event));
+                            // Wait on the socket
+                            auto n = poller.wait();
 
-                            // The event loop
-                            // Watch for signals
-                            while (s_running_)
+                            for (int i = 0; i < n; ++i)
                             {
-                                // Wait on the socket
-                                int n = ::epoll_wait(efd_, events, s_max_events, -1);
+                                const auto& ent = poller[i];
 
-                                for (int i = 0; i < n; ++i)
+                                auto thefd = ent.data.fd;
+
+                                // Check for errors
+                                if ((ent.events & EPOLLERR) || (ent.events & EPOLLHUP) || (!(ent.events & EPOLLIN)))
                                 {
-                                    auto thefd = events[i].data.fd;
+                                    ::fprintf(s_log_stream_, "epoll error for fd %d\n", thefd);
 
-                                    // Check for errors
-                                    if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
+                                    // Remove the fd
+                                    remove_fd(thefd);
+
+                                    // Unregister epoll
+                                    if (poller.delete_fd(thefd) < 0)
                                     {
-                                        ::fprintf(s_log_stream_, "epoll error for fd %d\n", thefd);
-
-                                        // Remove the fd
-                                        remove_fd(thefd);
-
-                                        // Unregister epoll
-                                        s = ::epoll_ctl(efd_, EPOLL_CTL_DEL, thefd, nullptr);
-
-                                        if (s == -1)
-                                        {
-                                            write_log_fatal("Debug: epoll_ctl");
-                                        }
-                                        ::close(thefd);
+                                        write_log_fatal("Debug: epoll_ctl");
                                     }
-                                    else if (sfd_ == thefd)
+                                    ::close(thefd);
+                                }
+                                else if (sfd_ == thefd)
+                                {
+                                    // Event(s) on the main port
+                                    sockaddr in_addr;
+                                    socklen_t in_len {sizeof(in_addr)};
+                                    char hbuf[NI_MAXHOST];
+                                    char sbuf[NI_MAXSERV];
+
+                                    for (;;)
                                     {
-                                        // Event(s) on the main port
-                                        sockaddr in_addr;
-                                        socklen_t in_len {sizeof(in_addr)};
-                                        char hbuf[NI_MAXHOST];
-                                        char sbuf[NI_MAXSERV];
-
-                                        for (;;)
+                                        int infd = ::accept(sfd_, &in_addr, &in_len);
+                                        if (infd == -1)
                                         {
-                                            int infd = ::accept(sfd_, &in_addr, &in_len);
-                                            if (infd == -1)
+                                            if (errno == EAGAIN || errno == EWOULDBLOCK)
                                             {
-                                                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                                                {
-                                                    // Poll again
-                                                    break;
-                                                }
-                                                else
-                                                {
-                                                    write_log("Debug: accepted all connections\n");
-                                                    break;
-                                                }
-                                            }
-
-                                            s = ::getnameinfo(&in_addr, in_len,
-                                              hbuf, sizeof(hbuf),
-                                              sbuf, sizeof(sbuf),
-                                              NI_NUMERICHOST | NI_NUMERICSERV);
-                                            if (s == 0)
-                                            {
-                                                ::fprintf(s_log_stream_, "Accepted connection on descriptor %d "
-                                                                         "(host=%s, port=%s)\n",
-                                                  infd, hbuf, sbuf);
-                                            }
-
-                                            // Make the incoming socket non-blocking and add it to the list of fds to monitor.
-                                            if (!make_socket_non_blocking(infd))
-                                            {
-                                                write_log_fatal("Debug: make_socket_non_blocking failed\n");
-                                            }
-
-                                            event.data.fd = infd;
-                                            event.events = EPOLLIN | EPOLLET;
-                                            s = ::epoll_ctl(efd_, EPOLL_CTL_ADD, infd, &event);
-
-                                            if (s == -1)
-                                            {
-                                                write_log_fatal("Debug: epoll_ctl failed to add file handle");
+                                                // Poll again
+                                                break;
                                             }
                                             else
                                             {
-                                                // Monitor this fd
-                                                allfds_.push_back(infd);
-                                            }
-                                        }
-                                    }
-                                    else
-                                    {
-                                        bool done {false};
-
-                                        while (s_running_)
-                                        {
-                                            ssize_t count;
-                                            char buf[512];
-                                            ::memset(buf, 0, sizeof(buf));
-
-                                            // Read from the fd
-                                            count = ::read(events[i].data.fd, buf, sizeof(buf));
-                                            if (count == -1)
-                                            {
-                                                // If errno == EAGAIN, that means we have read all data. Keep going
-                                                done = errno != EAGAIN;
-                                                // And break from while loop
+                                                write_log("Debug: accepted all connections\n");
                                                 break;
-                                            }
-                                            if (count == 0)
-                                            {
-                                                // The remote has closed the connection or no data
-                                                done = true;
-                                                break;
-                                            }
-
-                                            // Process data from this source
-                                            s = process_command(events[i].data.fd, buf, count);
-
-                                            if (s == -1)
-                                            {
-                                                write_log_fatal("Debug: write");
                                             }
                                         }
 
-                                        if (done)
+                                        s = ::getnameinfo(&in_addr, in_len,
+                                          hbuf, sizeof(hbuf),
+                                          sbuf, sizeof(sbuf),
+                                          NI_NUMERICHOST | NI_NUMERICSERV);
+                                        if (s == 0)
                                         {
-                                            std::cout << "Closed connection on descriptor " << events[i].data.fd << std::endl;
+                                            ::fprintf(s_log_stream_, "Accepted connection on descriptor %d "
+                                                                     "(host=%s, port=%s)\n",
+                                              infd, hbuf, sbuf);
+                                        }
 
-                                            // Closing the descriptor will make epoll remove it from the set of descriptors which are monitored.
-                                            remove_fd(events[i].data.fd);
-                                            ::close(events[i].data.fd);
+                                        // Make the incoming socket non-blocking and add it to the list of fds to monitor.
+                                        if (!set_socket_non_blocking(infd))
+                                        {
+                                            write_log_fatal("Debug: set_socket_non_blocking failed\n");
+                                        }
+
+                                        if (poller.add_fd(infd) < 0)
+                                        {
+                                            write_log_fatal("Debug: epoll_ctl failed to add file handle");
+                                        }
+                                        else
+                                        {
+                                            // Monitor this fd
+                                            allfds_.push_back(infd);
                                         }
                                     }
                                 }
-                            }
+                                else
+                                {
+                                    bool done {false};
 
-                            delete[] events;
+                                    while (s_running_)
+                                    {
+                                        ssize_t count;
+                                        char buf[512];
+                                        ::memset(buf, 0, sizeof(buf));
+
+                                        // Read from the fd
+                                        count = ::read(thefd, buf, sizeof(buf));
+                                        if (count == -1)
+                                        {
+                                            // If errno == EAGAIN, that means we have read all data. Keep going
+                                            done = errno != EAGAIN;
+                                            // And break from while loop
+                                            break;
+                                        }
+                                        if (count == 0)
+                                        {
+                                            // The remote has closed the connection or no data
+                                            done = true;
+                                            break;
+                                        }
+
+                                        // Process data from this source
+                                        s = process_command(thefd, buf, count);
+
+                                        if (s == -1)
+                                        {
+                                            write_log_fatal("Debug: write");
+                                        }
+                                    }
+
+                                    if (done)
+                                    {
+                                        std::cout << "Closed connection on descriptor " << thefd << std::endl;
+
+                                        // Closing the descriptor will make epoll remove it from the set of descriptors which are monitored.
+                                        remove_fd(thefd);
+                                        ::close(thefd);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

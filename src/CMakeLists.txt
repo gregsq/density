@@ -1,7 +1,8 @@
 include(cppflags)
 
 add_executable(densityapp
-  densityapp.cpp)
+  densityapp.cpp
+  epoller.cpp)
 
 include_directories(
   ../inc
