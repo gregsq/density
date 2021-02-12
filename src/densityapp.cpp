@@ -36,49 +36,48 @@ Options are:
 
 namespace density {
 
-    FILE* DensityApp::log_stream {nullptr};
-    int32_t DensityApp::pid_fd {-1};
-	std::string DensityApp::pid_file_name;
-	bool DensityApp::running {false};
+    FILE* DensityApp::s_log_stream_ {nullptr};
+    int32_t DensityApp::s_pid_fd_ {-1};
+    std::string DensityApp::s_pid_file_name_;
+    bool DensityApp::s_running_ {false};
 
-    auto DensityApp::write_log(const std::string& s) -> void
+    auto DensityApp::write_log(const std::string& s) noexcept -> void
     {
-        auto ret = ::fprintf(log_stream, s.c_str());
+        auto ret = ::fprintf(s_log_stream_, s.c_str());
         if (ret < 0)
         {
             syslog(LOG_ERR, "Can not write to log stream: %s, error: %s",
-              (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
+              (s_log_stream_ == stdout) ? "stdout" : log_file_name_.c_str(), strerror(errno));
         }
     }
 
     // Write message and raise SIGABORT
-    NORETURN auto DensityApp::write_log_fatal(const std::string& s) -> void
+    auto DensityApp::write_log_fatal(const std::string& s) -> void
     {
-        auto ret = ::fprintf(log_stream, s.c_str());
-        if (ret < 0)
-        {
-            ::syslog(LOG_ERR, "Can not write to log stream: %s, error: %s",
-              (log_stream == stdout) ? "stdout" : log_file_name.c_str(), strerror(errno));
-        }
-        abort();
+        std::string err(s);
+        err += "\n";
+
+        write_log(err);
+        // Raise an error
+        throw std::logic_error(s);
     }
 
     /// \brief
     ///
     /// Remove an fd from the attached record
-    auto DensityApp::remove_fd(int32_t fd) -> void
+    auto DensityApp::remove_fd(int32_t fd) noexcept -> void
     {
-        for (auto it = allfds.begin(); it != allfds.end(); ++it)
+        for (auto it = allfds_.begin(); it != allfds_.end(); ++it)
         {
             if (*it == fd)
             {
-                allfds.erase(it);
+                allfds_.erase(it);
                 break;
             }
         }
     }
 
-   auto DensityApp::process_command(
+    auto DensityApp::process_command(
       int32_t fd,
       const char* telstr,
       std::size_t count) -> int32_t
@@ -125,10 +124,10 @@ namespace density {
                         if (command == "INCR")
                         {
                             // Increment
-                            if (counter <= 0 || (maxcount - counter) >= result)
+                            if (counter_ <= 0 || (maxcount - counter_) >= result)
                             {
                                 // Increase the counter
-                                counter += result;
+                                counter_ += result;
                                 // Notify
                             }
                             else
@@ -139,10 +138,10 @@ namespace density {
                         else if (command == "DECR")
                         {
                             // Decrement
-                            if (counter >= 0 || (counter - mincount) >= result)
+                            if (counter_ >= 0 || (counter_ - mincount) >= result)
                             {
                                 // Decrease the counter
-                                counter -= result;
+                                counter_ -= result;
                                 // Notify
                             }
                             else
@@ -153,14 +152,14 @@ namespace density {
 
                         if (success)
                         {
-                            if (density::to_chars(reply, counter))
+                            if (density::to_chars(reply, counter_))
                             {
                                 reply += "\n";
                                 // Write to the connection that sent it
                                 ::write(fd, reply.c_str(), reply.length());
 
                                 // Write to all connections
-                                for (auto f : allfds)
+                                for (auto f : allfds_)
                                 {
                                     if (f != fd)
                                     {
@@ -179,7 +178,7 @@ namespace density {
                 {
                     if (splits[0] == "OUTPUT")
                     {
-                        if (density::to_chars(reply, counter))
+                        if (density::to_chars(reply, counter_))
                         {
                             reply += "\n";
                             ::write(fd, reply.c_str(), reply.length());
@@ -200,24 +199,24 @@ namespace density {
 
         return count;
     }
-	
-    auto DensityApp::make_socket_non_blocking(int32_t sfd) -> int32_t
-    {
-        int32_t ret {0};
 
-        auto flags = ::fcntl(sfd, F_GETFL, 0);
+    auto DensityApp::make_socket_non_blocking(int32_t sock) noexcept -> bool
+    {
+        bool ret {true};
+
+        auto flags = ::fcntl(sock, F_GETFL, 0);
         if (flags < 0)
         {
-            ret = -1;
+            ret = false;
             write_log("Debug: fcntl F_GETFL failed");
         }
         else
         {
             flags |= O_NONBLOCK;
-            auto s = ::fcntl(sfd, F_SETFL, flags);
+            auto s = ::fcntl(sock, F_SETFL, flags);
             if (s < 0)
             {
-                ret = -1;
+                ret = false;
                 write_log("Debug: fcntl F_SETFL failed");
             }
         }
@@ -225,7 +224,7 @@ namespace density {
         return ret;
     }
 
-   auto DensityApp::create_and_bind() -> int32_t
+    auto DensityApp::create_and_bind() noexcept -> int32_t
     {
         addrinfo hints;
         addrinfo *result, *rp;
@@ -236,10 +235,10 @@ namespace density {
         hints.ai_socktype = SOCK_STREAM;    // We want a TCP socket
         hints.ai_flags = AI_PASSIVE;        // All interfaces
 
-        auto s = ::getaddrinfo(nullptr, port.c_str(), &hints, &result);
+        auto s = ::getaddrinfo(nullptr, port_.c_str(), &hints, &result);
         if (s != 0)
         {
-            ::fprintf(log_stream, "getaddrinfo: %s\n", gai_strerror(s));
+            ::fprintf(s_log_stream_, "getaddrinfo: %s\n", gai_strerror(s));
         }
         else
         {
@@ -254,7 +253,7 @@ namespace density {
                 s = ::bind(sfd, rp->ai_addr, rp->ai_addrlen);
                 if (s == 0)
                 {
-                    // We managed to bind successfully!
+                    // No bound to the port!
                     break;
                 }
 
@@ -264,7 +263,7 @@ namespace density {
 
             if (rp == nullptr)
             {
-                ::fprintf(log_stream, "Could not bind to port %s\n", port.c_str());
+                ::fprintf(s_log_stream_, "Could not bind to port %s\n", port_.c_str());
             }
 
             freeaddrinfo(result);
@@ -275,21 +274,19 @@ namespace density {
 
     /// \brief Epoll till done
     ///
-    /// \param port The port number
     /// \return success or fail
-    auto DensityApp::do_epoll() -> int32_t
+    auto DensityApp::do_epoll() -> bool
     {
         // Create and bind a tcp socket to the port
-        auto sfd = create_and_bind();
-        if (sfd == -1)
+        sfd_ = create_and_bind();
+        if (sfd_ == -1)
         {
             write_log_fatal("Debug: create_and_bind failed");
         }
         else
         {
             // Make the socket non blocking
-            auto s = make_socket_non_blocking(sfd);
-            if (s == -1)
+            if (!make_socket_non_blocking(sfd_))
             {
                 write_log_fatal("Debug: make_socket_non_blocking failed");
             }
@@ -298,24 +295,24 @@ namespace density {
                 epoll_event event;
 
                 // Listen on the socket
-                s = ::listen(sfd, SOMAXCONN);
+                auto s = ::listen(sfd_, SOMAXCONN);
                 if (s == -1)
                 {
                     write_log_fatal("Debug: listen failed");
                 }
                 else
                 {
-                    auto efd = ::epoll_create1(0);
-                    if (efd == -1)
+                    efd_ = ::epoll_create1(0);
+                    if (efd_ == -1)
                     {
                         write_log_fatal("Debug: epoll_create failed");
                     }
                     else
                     {
-                        event.data.fd = sfd;
+                        event.data.fd = sfd_;
                         event.events = EPOLLIN | EPOLLET;
 
-                        s = ::epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &event);
+                        s = ::epoll_ctl(efd_, EPOLL_CTL_ADD, sfd_, &event);
 
                         if (s == -1)
                         {
@@ -329,21 +326,33 @@ namespace density {
 
                             // The event loop
                             // Watch for signals
-                            while (running)
+                            while (s_running_)
                             {
                                 // Wait on the socket
-                                int n = ::epoll_wait(efd, events, s_max_events, -1);
+                                int n = ::epoll_wait(efd_, events, s_max_events, -1);
 
                                 for (int i = 0; i < n; ++i)
                                 {
+                                    auto thefd = events[i].data.fd;
+
+                                    // Check for errors
                                     if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN)))
                                     {
-                                        ::fprintf(log_stream, "epoll error\n");
+                                        ::fprintf(s_log_stream_, "epoll error for fd %d\n", thefd);
 
-                                        remove_fd(events[i].data.fd);
-                                        ::close(events[i].data.fd);
+                                        // Remove the fd
+                                        remove_fd(thefd);
+
+                                        // Unregister epoll
+                                        s = ::epoll_ctl(efd_, EPOLL_CTL_DEL, thefd, nullptr);
+
+                                        if (s == -1)
+                                        {
+                                            write_log_fatal("Debug: epoll_ctl");
+                                        }
+                                        ::close(thefd);
                                     }
-                                    else if (sfd == events[i].data.fd)
+                                    else if (sfd_ == thefd)
                                     {
                                         // Event(s) on the main port
                                         sockaddr in_addr;
@@ -353,12 +362,12 @@ namespace density {
 
                                         for (;;)
                                         {
-                                            int infd = ::accept(sfd, &in_addr, &in_len);
+                                            int infd = ::accept(sfd_, &in_addr, &in_len);
                                             if (infd == -1)
                                             {
                                                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                                                 {
-                                                    // Processed all incoming connections.
+                                                    // Poll again
                                                     break;
                                                 }
                                                 else
@@ -374,28 +383,29 @@ namespace density {
                                               NI_NUMERICHOST | NI_NUMERICSERV);
                                             if (s == 0)
                                             {
-                                                ::fprintf(log_stream, "Accepted connection on descriptor %d "
-                                                                      "(host=%s, port=%s)\n",
+                                                ::fprintf(s_log_stream_, "Accepted connection on descriptor %d "
+                                                                         "(host=%s, port=%s)\n",
                                                   infd, hbuf, sbuf);
                                             }
 
                                             // Make the incoming socket non-blocking and add it to the list of fds to monitor.
-                                            s = make_socket_non_blocking(infd);
-                                            if (s == -1)
+                                            if (!make_socket_non_blocking(infd))
                                             {
-                                                write_log_fatal("Debug: make_socket_non_blocking\n");
+                                                write_log_fatal("Debug: make_socket_non_blocking failed\n");
                                             }
-
-                                            // Monitor this fd
-                                            allfds.push_back(infd);
 
                                             event.data.fd = infd;
                                             event.events = EPOLLIN | EPOLLET;
-                                            s = ::epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
+                                            s = ::epoll_ctl(efd_, EPOLL_CTL_ADD, infd, &event);
 
                                             if (s == -1)
                                             {
-                                                write_log_fatal("Debug: epoll_ctl");
+                                                write_log_fatal("Debug: epoll_ctl failed to add file handle");
+                                            }
+                                            else
+                                            {
+                                                // Monitor this fd
+                                                allfds_.push_back(infd);
                                             }
                                         }
                                     }
@@ -403,7 +413,7 @@ namespace density {
                                     {
                                         bool done {false};
 
-                                        while (running)
+                                        while (s_running_)
                                         {
                                             ssize_t count;
                                             char buf[512];
@@ -452,10 +462,11 @@ namespace density {
                 }
             }
 
-            ::close(sfd);
+            ::close(sfd_);
+            sfd_ = -1;
         }
 
-        return EXIT_SUCCESS;
+        return true;
     }
 
     /// \brief This function will daemonize this app
@@ -466,80 +477,84 @@ namespace density {
         // Fork off the parent process
         pid_t pid = ::fork();
 
-        // An error occurred
-        if (pid < 0)
-        {
-            exit(EXIT_FAILURE);
-        }
-
         // Success: Let the parent terminate
-        else if (pid > 0)
+        if (pid > 0)
         {
             exit(EXIT_SUCCESS);
         }
-
+        else if (pid < 0 || setsid() < 0)
+        {
+            // An error occurred
+            if (pid < 0)
+            {
+                write_log_fatal("pid < 0");
+            }
+            else
+            {
+                write_log_fatal("setsid() < 0");
+            }
+        }
         // On success: The child process becomes session leader
-        else if (setsid() < 0)
+        else
         {
-            exit(EXIT_FAILURE);
-        }
+            // Ignore signal sent from child to parent process
+            ::signal(SIGCHLD, SIG_IGN);
 
-        // Ignore signal sent from child to parent process
-        ::signal(SIGCHLD, SIG_IGN);
+            // Fork off for the second time
+            pid = ::fork();
 
-        // Fork off for the second time
-        pid = ::fork();
-
-        // An error occurred
-        if (pid < 0)
-        {
-            exit(EXIT_FAILURE);
-        }
-
-        // Success: Let the parent terminate
-        else if (pid > 0)
-        {
-            exit(EXIT_SUCCESS);
-        }
-
-        // Set new file permissions
-        ::umask(0);
-
-        // Change the working directory to the root directory
-        // or another appropriated directory
-        ::chdir("/");
-
-        // Close all open file descriptors
-        for (fd = ::sysconf(_SC_OPEN_MAX); fd > 0; fd--)
-        {
-            ::close(fd);
-        }
-
-        // Reopen stdin (fd = 0), stdout (fd = 1), stderr (fd = 2)
-        stdin = ::fopen("/dev/null", "r");
-        stdout = ::fopen("/dev/null", "w+");
-        stderr = ::fopen("/dev/null", "w+");
-
-        // Try to write PID of daemon to lockfile
-        if (!pid_file_name.empty())
-        {
-            pid_fd = ::open(pid_file_name.c_str(), O_RDWR | O_CREAT, 0640);
-            if (pid_fd < 0 || ::lockf(pid_fd, F_TLOCK, 0) < 0)
+            // An error occurred
+            if (pid < 0)
             {
-                // Can't open lockfile
-                exit(EXIT_FAILURE);
+                write_log_fatal("Daemonize: pid < 0");
             }
 
-            std::string asstring;
-
-            if (!density::to_chars(asstring, getpid()))
+            // Success: Let the parent terminate
+            else if (pid > 0)
             {
-                // Should never happen
-                ::exit(EXIT_FAILURE);
+                ::exit(EXIT_SUCCESS);
             }
+            else
+            {
+                // Set new file permissions
+                ::umask(0);
 
-            // Write PID to lockfile
-            ::write(pid_fd, asstring.c_str(), asstring.length());
+                // Change the working directory to the root directory
+                // or another appropriated directory
+                ::chdir("/");
+
+                // Close all open file descriptors
+                for (fd = ::sysconf(_SC_OPEN_MAX); fd > 0; fd--)
+                {
+                    ::close(fd);
+                }
+
+                // Reopen stdin (fd = 0), stdout (fd = 1), stderr (fd = 2)
+                stdin = ::fopen("/dev/null", "r");
+                stdout = ::fopen("/dev/null", "w+");
+                stderr = ::fopen("/dev/null", "w+");
+
+                // Try to write PID of daemon to lockfile
+                if (!s_pid_file_name_.empty())
+                {
+                    s_pid_fd_ = ::open(s_pid_file_name_.c_str(), O_RDWR | O_CREAT, 0640);
+                    if (s_pid_fd_ < 0 || ::lockf(s_pid_fd_, F_TLOCK, 0) < 0)
+                    {
+                        // Can't open lockfile
+                        write_log_fatal("Daemonize: Unable to opn pid file");
+                    }
+
+                    std::string asstring;
+                    if (!density::to_chars(asstring, getpid()))
+                    {
+                        // Should never happen
+                        write_log_fatal("Daemonize: to_chars failed");
+                    }
+
+                    // Write PID to lockfile
+                    ::write(s_pid_fd_, asstring.c_str(), asstring.length());
+                }
+            }
         }
     }
 
@@ -554,36 +569,37 @@ namespace density {
     {
         if (sig == SIGINT || sig == SIGTERM)
         {
-            ::fprintf(log_stream, "Debug: stopping daemon ...\n");
+            ::fprintf(s_log_stream_, "Debug: stopping daemon ...\n");
 
             // Unlock and close lockfile
-            if (pid_fd != -1)
+            if (s_pid_fd_ != -1)
             {
-                ::lockf(pid_fd, F_ULOCK, 0);
-                ::close(pid_fd);
+                ::lockf(s_pid_fd_, F_ULOCK, 0);
+                ::close(s_pid_fd_);
             }
             // Try to delete lockfile
-            if (!pid_file_name.empty())
+            if (!s_pid_file_name_.empty())
             {
-                ::unlink(pid_file_name.c_str());
-				pid_file_name = "";				
+                ::unlink(s_pid_file_name_.c_str());
+                s_pid_file_name_ = "";
             }
 
-            running = false;
+            s_running_ = false;
 
             // Reset signal handling to default behavior
             ::signal(SIGINT, SIG_DFL);
         }
         else if (sig == SIGHUP)
         {
-            ::fprintf(log_stream, "Debug: received SIGHUP signal\n");
+            ::fprintf(s_log_stream_, "Debug: received SIGHUP signal\n");
         }
         else if (sig == SIGCHLD)
         {
-            ::fprintf(log_stream, "Debug: received SIGCHLD signal\n");
+            ::fprintf(s_log_stream_, "Debug: received SIGCHLD signal\n");
         }
     }
 
+    /// \brief Set up signal handling
     auto DensityApp::s_catch_signals() -> void
     {
         struct sigaction action;
@@ -599,9 +615,10 @@ namespace density {
     }
 
     DensityApp::DensityApp(int argc, char* const* argv)
-		: port("8089")
-		, appname(argv[0])
-		, counter(0)
+        : port_("8089")
+        , appname_(argv[0])
+        , counter_(0)
+        , helpmode_(false)
     {
         const option long_opts[] = {
           {"log_file", required_argument, nullptr, 'l'},
@@ -625,14 +642,14 @@ namespace density {
             switch (opt)
             {
                 case 'l':
-                    log_file_name = optarg;
+                    log_file_name_ = optarg;
                     break;
                 case 'p':
-                    pid_file_name = optarg;
+                    s_pid_file_name_ = optarg;
                     break;
                 case 'i':
                     // Override port
-                    port = optarg;
+                    port_ = optarg;
                     break;
                 case 'd':
                     // Run as a daemon
@@ -641,72 +658,119 @@ namespace density {
                 case 'h':
                 case '?':
                 default:
+                    helpmode_ = true;
+                    // Print help and
                     print_help();
             }
         }
 
-        if (start_daemonized)
+        if (!helpmode_)
         {
-            daemonize();
-        }
-
-        // This global variable can be changed in function handling signal
-        running = true;
-
-        // Install a signal handler
-        s_catch_signals();
-
-        try
-        {
-            // Open system log and write message to it
-            openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
-
-            ::syslog(LOG_INFO, "Started %s", argv[0]);
-
-            // Try to open log file to this daemon
-            if (!log_file_name.empty())
+            if (start_daemonized)
             {
-                log_stream = ::fopen(log_file_name.c_str(), "a+");
-                if (log_stream == nullptr)
+                daemonize();
+            }
+
+            // This static variable can be changed in function handling signal
+            s_running_ = true;
+
+            // Install the signal handler
+            s_catch_signals();
+
+            try
+            {
+                // Open system log and write message to it
+                openlog(argv[0], LOG_PID | LOG_CONS, LOG_DAEMON);
+
+                ::syslog(LOG_INFO, "Started %s", argv[0]);
+
+                // Try to open log file
+                if (!log_file_name_.empty())
                 {
-                    ::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
-                      log_file_name.c_str(), strerror(errno));
-                    log_stream = stdout;
+                    s_log_stream_ = ::fopen(log_file_name_.c_str(), "a+");
+                    if (s_log_stream_ == nullptr)
+                    {
+                        ::syslog(LOG_ERR, "Can not open log file: %s, error: %s",
+                          log_file_name_.c_str(), ::strerror(errno));
+                        s_log_stream_ = stdout;
+                    }
+                }
+                else
+                {
+                    // Backup to stdout
+                    // When a daemon this will be /dev/null
+                    s_log_stream_ = stdout;
                 }
             }
-            else
+            catch (const std::exception& e)
             {
-                log_stream = stdout;
+                std::cout << "Caught exception " << e.what() << std::endl;
             }
-
-        }
-        catch (const std::exception& e)
-        {
-            std::cout << "Caught exception " << e.what() << std::endl;
         }
     }
 
-    int32_t DensityApp::run()
+    DensityApp::~DensityApp()
     {
-        int32_t retcode = do_epoll();
-
-        // Close log file, when it is used.
-        if (log_stream != stdout)
+        if (efd_ >= 0)
         {
-            ::fclose(log_stream);
+            ::close(efd_);
+        }
+        if (sfd_ >= 0)
+        {
+            ::close(sfd_);
+        }
+    }
+
+    auto DensityApp::close_log() noexcept -> void
+    {
+        // Close log file, when it is used.
+        if (s_log_stream_ != stdout)
+        {
+            ::fclose(s_log_stream_);
         }
 
         // Write system log and close it.
-        ::syslog(LOG_INFO, "Stopped %s", appname.c_str());
+        ::syslog(LOG_INFO, "Stopped %s", appname_.c_str());
         ::closelog();
+    }
+
+    // Run in main try block
+    auto DensityApp::run() -> int32_t
+    {
+        int32_t retcode {0};
+        if (!helpmode_)
+        {
+            try
+            {
+                retcode = do_epoll();
+                close_log();
+            }
+            catch (const std::exception& e)
+            {
+                close_log();
+                throw;
+            }
+        }
+
         return retcode;
     }
 
 }    // namespace density
 
-int main(int argc, char* const* argv)
+auto main(int argc, char* const* argv) -> int
 {
-    density::DensityApp app(argc, argv);
-    return app.run();
-}
+    int32_t ret {EXIT_SUCCESS};
 
+    try
+    {
+        density::DensityApp app(argc, argv);
+        ret = app.run() ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Error: " << e.what() << std::endl;
+        ret = EXIT_FAILURE;
+    }
+
+    return ret;
+}

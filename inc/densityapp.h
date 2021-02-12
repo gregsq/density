@@ -11,34 +11,39 @@ namespace density {
     class DensityApp
     {
         // Default port number
-        std::string port {"8089"};
+        std::string port_ {"8089"};
 
         // The app name from argv
-        std::string appname;
+        std::string appname_;
 
-        std::string log_file_name;
-        std::vector<int32_t> allfds;
-        int64_t counter {0};
+        std::string log_file_name_;
+        std::vector<int32_t> allfds_;
+        int64_t counter_ {0};
+        bool helpmode_ {false};
+        int32_t sfd_ {-1};
+        int32_t efd_ {-1};
 
-        static std::string pid_file_name;
-        static bool running;
-        static int32_t pid_fd;
-        static FILE* log_stream;
+        static std::string s_pid_file_name_;
+        static bool s_running_;
+        static int32_t s_pid_fd_;
+        static FILE* s_log_stream_;
 
-        auto write_log(const std::string& s) -> void;
+        auto write_log(const std::string& s) noexcept -> void;
+        auto close_log() noexcept -> void;
 
-        NORETURN auto write_log_fatal(const std::string& s) -> void;
+        // Write an error and exit
+        auto write_log_fatal(const std::string& s) -> void;
 
-        auto remove_fd(int32_t fd) -> void;
+        auto remove_fd(int32_t fd) noexcept -> void;
 
         auto process_command(
           int32_t fd,
           const char* telstr,
           std::size_t count) -> int32_t;
 
-        auto make_socket_non_blocking(int32_t sfd) -> int32_t;
-        auto create_and_bind() -> int32_t;
-        auto do_epoll() -> int32_t;
+        auto make_socket_non_blocking(int32_t) noexcept -> bool;
+        auto create_and_bind() noexcept -> int32_t;
+        auto do_epoll() -> bool;
 
         // Run daemonized
         auto daemonize() -> void;
@@ -57,7 +62,7 @@ namespace density {
         DensityApp() = delete;
         DensityApp(const DensityApp&) = delete;
         DensityApp(DensityApp&&) = delete;
-        ~DensityApp() = default;
+        ~DensityApp();
 
         auto operator=(const DensityApp&) -> DensityApp& = delete;
         auto operator=(DensityApp&&) -> DensityApp& = delete;
