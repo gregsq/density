@@ -46,7 +46,7 @@ namespace density {
         auto do_epoll() -> bool;
 
         // Run daemonized
-        auto daemonize() -> void;
+        auto daemonize(const std::string& work_dir) -> void;
 
         auto print_help() -> void;
 

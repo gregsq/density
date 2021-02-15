@@ -447,91 +447,86 @@ namespace density {
     }
 
     /// \brief This function will daemonize this app
-    auto DensityApp::daemonize() -> void
+    auto DensityApp::daemonize(const std::string& work_dir) -> void
     {
-        int fd;
+        // Our process ID and Session ID
+        pid_t pid, sid;
 
         // Fork off the parent process
-        pid_t pid = ::fork();
-
-        // Success: Let the parent terminate
+        pid = fork();
+        if (pid < 0)
+        {
+            write_log_fatal("pid < 0");
+        }
+        // If we got a good PID, then we can exit the parent process.
         if (pid > 0)
         {
             exit(EXIT_SUCCESS);
         }
-        else if (pid < 0 || setsid() < 0)
+        // Create a new SID for the child process
+        sid = setsid();
+        if (sid < 0)
         {
-            // An error occurred
-            if (pid < 0)
-            {
-                write_log_fatal("pid < 0");
-            }
-            else
-            {
-                write_log_fatal("setsid() < 0");
-            }
+            write_log_fatal("setsid() < 0");
         }
-        // On success: The child process becomes session leader
-        else
+
+        // Change the file mode mask
+        ::umask(0);
+
+        // Change the current working directory
+        if (!work_dir.empty() && ::chdir(work_dir.c_str()) < 0)
         {
-            // Ignore signal sent from child to parent process
-            ::signal(SIGCHLD, SIG_IGN);
+            std::string err {"chdir(work_dir) "};
+            err += work_dir;
+            err += " failed";
 
-            // Fork off for the second time
-            pid = ::fork();
+            write_log_fatal(err);
+        }
 
-            // An error occurred
-            if (pid < 0)
+        // Rely on CLOSE ON EXEC
+#if 0
+        // Close all open file descriptors
+        for (int fd = ::sysconf(_SC_OPEN_MAX); fd > 0; fd--)
+        {
+            ::close(fd);
+        }
+#endif
+
+        // Close the standard file descriptors
+        int zfd = open("/dev/null", O_RDONLY);
+        if (zfd == -1)
+        {
+            write_log_fatal("open(/dev/null) failed");
+        }
+
+        ::close(STDIN_FILENO);
+        ::close(STDOUT_FILENO);
+        ::close(STDERR_FILENO);
+        if (dup2(zfd, STDIN_FILENO) == -1 || dup2(zfd, STDOUT_FILENO) == -1 || dup2(zfd, STDERR_FILENO) == -1)
+        {
+            write_log_fatal("dup2(stdin/stdout/etderr) failed");
+        }
+        ::close(zfd);
+
+        // Try to write PID of daemon to lockfile
+        if (!s_pid_file_name_.empty())
+        {
+            s_pid_fd_ = ::open(s_pid_file_name_.c_str(), O_RDWR | O_CREAT, 0640);
+            if (s_pid_fd_ < 0 || ::lockf(s_pid_fd_, F_TLOCK, 0) < 0)
             {
-                write_log_fatal("Daemonize: pid < 0");
+                // Can't open lockfile
+                write_log_fatal("Daemonize: Unable to open pid file");
             }
 
-            // Success: Let the parent terminate
-            else if (pid > 0)
+            std::string asstring;
+            if (!density::to_chars(asstring, getpid()))
             {
-                ::exit(EXIT_SUCCESS);
+                // Should never happen
+                write_log_fatal("Daemonize: to_chars failed");
             }
-            else
-            {
-                // Set new file permissions
-                ::umask(0);
 
-                // Change the working directory to the root directory
-                // or another appropriated directory
-                ::chdir("/");
-
-                // Close all open file descriptors
-                for (fd = ::sysconf(_SC_OPEN_MAX); fd > 0; fd--)
-                {
-                    ::close(fd);
-                }
-
-                // Reopen stdin (fd = 0), stdout (fd = 1), stderr (fd = 2)
-                stdin = ::fopen("/dev/null", "r");
-                stdout = ::fopen("/dev/null", "w+");
-                stderr = ::fopen("/dev/null", "w+");
-
-                // Try to write PID of daemon to lockfile
-                if (!s_pid_file_name_.empty())
-                {
-                    s_pid_fd_ = ::open(s_pid_file_name_.c_str(), O_RDWR | O_CREAT, 0640);
-                    if (s_pid_fd_ < 0 || ::lockf(s_pid_fd_, F_TLOCK, 0) < 0)
-                    {
-                        // Can't open lockfile
-                        write_log_fatal("Daemonize: Unable to opn pid file");
-                    }
-
-                    std::string asstring;
-                    if (!density::to_chars(asstring, getpid()))
-                    {
-                        // Should never happen
-                        write_log_fatal("Daemonize: to_chars failed");
-                    }
-
-                    // Write PID to lockfile
-                    ::write(s_pid_fd_, asstring.c_str(), asstring.length());
-                }
-            }
+            // Write PID to lockfile
+            ::write(s_pid_fd_, asstring.c_str(), asstring.length());
         }
     }
 
@@ -597,18 +592,21 @@ namespace density {
         , counter_(0)
         , helpmode_(false)
     {
+        std::string work_dir;
+
         const option long_opts[] = {
           {"log_file", required_argument, nullptr, 'l'},
           {"interface", required_argument, nullptr, 'i'},
           {"help", no_argument, nullptr, 'h'},
           {"daemon", no_argument, nullptr, 'd'},
           {"pid_file", required_argument, nullptr, 'p'},
+          {"work_dir", required_argument, nullptr, 'w'},
           {nullptr, no_argument, nullptr, 0}};
 
         bool start_daemonized {false};
 
         // Try to process all command line arguments
-        const char* const short_opts {"i:l:p:dh"};
+        const char* const short_opts {"i:l:p:w:dh"};
 
         while (true)
         {
@@ -632,6 +630,10 @@ namespace density {
                     // Run as a daemon
                     start_daemonized = true;
                     break;
+                case 'w':
+                    // Set the working directory
+                    work_dir = optarg;
+                    break;
                 case 'h':
                 case '?':
                 default:
@@ -645,7 +647,7 @@ namespace density {
         {
             if (start_daemonized)
             {
-                daemonize();
+                daemonize(work_dir);
             }
 
             // This static variable can be changed in function handling signal
